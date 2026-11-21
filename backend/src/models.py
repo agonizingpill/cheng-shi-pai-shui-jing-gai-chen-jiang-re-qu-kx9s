@@ -34,6 +34,8 @@ class SurveyBatch(Base):
     coordinate_reference = Column(String(40), nullable=False)
     status = Column(String(30), nullable=False, default="open")
     notes = Column(Text, nullable=True)
+    # 已发布的待派工片区版本号。每次成功发布重算结果 +1，旧版本片区随即失效。
+    zone_revision = Column(Integer, nullable=False, default=0, server_default="0")
     points = relationship("SurveyPoint", back_populates="batch", cascade="all, delete-orphan")
 
 class SurveyPoint(Base):
@@ -51,9 +53,18 @@ class SurveyPoint(Base):
     quality_status = Column(String(30), nullable=False, default="unchecked")
     cluster_label = Column(Integer, nullable=True)
     local_density = Column(Float, nullable=True)
+    # initial = 首轮测量；supplement = 聚类出片后的补传测点
+    source = Column(String(20), nullable=False, default="initial", server_default="initial")
+    # 补测绘等幂键：(batch_id, supplement_key) 唯一，重试同一测点不会重复入库
+    supplement_key = Column(String(100), nullable=True)
+    # 该补测点最近一次被发布进待派工片区的版本号；小于批次 zone_revision 即为待重算
+    published_revision = Column(Integer, nullable=True)
     batch = relationship("SurveyBatch", back_populates="points")
     manhole = relationship("ManholeAsset")
-    __table_args__ = (UniqueConstraint("batch_id", "manhole_id", name="uq_survey_batch_manhole"),)
+    __table_args__ = (
+        UniqueConstraint("batch_id", "manhole_id", name="uq_survey_batch_manhole"),
+        UniqueConstraint("batch_id", "supplement_key", name="uq_survey_batch_supplement_key"),
+    )
 
 class RepairZone(Base):
     __tablename__ = "repair_zones"
@@ -74,6 +85,9 @@ class RepairZone(Base):
     split_from_id = Column(Integer, ForeignKey("repair_zones.id"), nullable=True)
     conflict_notice_id = Column(Integer, ForeignKey("work_notices.id"), nullable=True)
     split_reason = Column(Text, nullable=True)
+    # 所属的待派工发布版本，对应 SurveyBatch.zone_revision
+    revision = Column(Integer, nullable=True)
+    superseded_at = Column(DateTime(timezone=True), nullable=True)
 
 class WorkNotice(Base):
     __tablename__ = "work_notices"

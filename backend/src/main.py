@@ -8,13 +8,16 @@ from redis import Redis
 
 from .database import Base, SessionLocal, engine, get_db
 from .models import AnalysisJob, AuditLog, ManholeAsset, RepairZone, Resurvey, SurveyBatch, SurveyPoint, User, WorkNotice
-from .schemas import BatchIn, LoginIn, NoticeIn, ResurveyIn, SurveyPointIn
+from .schemas import BatchIn, LoginIn, NoticeIn, ResurveyIn, SupplementPointIn, SurveyPointIn
 from .security import create_token, current_user, require_roles, verify_password
 from .services.audit import record
 from .services.cluster import build_input
 from .services.geometry import bounds, overlaps
 from .middlewares.audit import RequestAuditMiddleware
 from .middlewares.rate_limit import SimpleRateLimitMiddleware
+from .constants.enums import DISPATCHABLE_ZONE_STATUSES, LOCKING_NOTICE_STATUSES
+
+BUSY_BATCH_STATUSES = ("queued", "recomputing")
 
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger("manhole-settlement")
@@ -27,6 +30,11 @@ redis_client = Redis.from_url(os.getenv("REDIS_URL", "redis://redis:6379/0"), de
 @app.on_event("startup")
 def startup():
     Base.metadata.create_all(engine)
+    try:
+        from .services.schema import ensure_schema
+        ensure_schema()
+    except Exception:
+        logger.exception("ensure_schema failed during startup")
     if os.getenv("SEED_DEMO", "true").lower() == "true":
         try:
             from scripts.seed_demo import seed
@@ -48,12 +56,14 @@ def asset_view(a):
     return {"id": a.id, "asset_code": a.asset_code, "street_name": a.street_name, "x": a.x, "y": a.y, "coordinate_reference": a.coordinate_reference, "cover_type": a.cover_type, "depth_mm": a.depth_mm, "status": a.status, "last_inspected_at": iso(a.last_inspected_at)}
 
 def point_view(p):
-    return {"id": p.id, "point_code": p.point_code, "batch_id": p.batch_id, "manhole_id": p.manhole_id, "asset_code": p.manhole.asset_code if p.manhole else "", "street_name": p.manhole.street_name if p.manhole else "", "x": p.x, "y": p.y, "elevation_mm": p.elevation_mm, "settlement_mm": p.settlement_mm, "coordinate_reference": p.coordinate_reference, "measured_at": iso(p.measured_at), "quality_status": p.quality_status, "cluster_label": p.cluster_label, "local_density": p.local_density}
+    return {"id": p.id, "point_code": p.point_code, "batch_id": p.batch_id, "manhole_id": p.manhole_id, "asset_code": p.manhole.asset_code if p.manhole else "", "street_name": p.manhole.street_name if p.manhole else "", "x": p.x, "y": p.y, "elevation_mm": p.elevation_mm, "settlement_mm": p.settlement_mm, "coordinate_reference": p.coordinate_reference, "measured_at": iso(p.measured_at), "quality_status": p.quality_status, "cluster_label": p.cluster_label, "local_density": p.local_density, "source": p.source or "initial", "supplement_key": p.supplement_key, "published_revision": p.published_revision}
 
 def zone_view(z, db):
     notice = db.get(WorkNotice, z.conflict_notice_id) if z.conflict_notice_id else None
+    notices = db.execute(select(WorkNotice).where(WorkNotice.zone_id == z.id)).scalars().all()
     point_rows = db.execute(select(SurveyPoint).where(SurveyPoint.id.in_(z.point_ids or []))).scalars().all() if z.point_ids else []
-    return {"id": z.id, "zone_code": z.zone_code, "batch_id": z.batch_id, "cluster_label": z.cluster_label, "name": z.name, "status": z.status, "point_ids": z.point_ids or [], "point_codes": [p.point_code for p in point_rows], "center_x": z.center_x, "center_y": z.center_y, "average_settlement_mm": z.average_settlement_mm, "max_settlement_mm": z.max_settlement_mm, "local_density": z.local_density, "boundary": z.boundary, "original_cluster_evidence": z.original_cluster_evidence, "split_from_id": z.split_from_id, "conflict_notice_id": z.conflict_notice_id, "split_reason": z.split_reason, "conflict_road": notice.road_name if notice else None}
+    locked_notice = next((n for n in notices if n.status in LOCKING_NOTICE_STATUSES), None)
+    return {"id": z.id, "zone_code": z.zone_code, "batch_id": z.batch_id, "cluster_label": z.cluster_label, "name": z.name, "status": z.status, "point_ids": z.point_ids or [], "point_codes": [p.point_code for p in point_rows], "center_x": z.center_x, "center_y": z.center_y, "average_settlement_mm": z.average_settlement_mm, "max_settlement_mm": z.max_settlement_mm, "local_density": z.local_density, "boundary": z.boundary, "original_cluster_evidence": z.original_cluster_evidence, "split_from_id": z.split_from_id, "conflict_notice_id": z.conflict_notice_id, "split_reason": z.split_reason, "conflict_road": notice.road_name if notice else None, "revision": z.revision, "superseded_at": iso(z.superseded_at), "locked": locked_notice is not None, "locked_notice_status": locked_notice.status if locked_notice else None, "dispatchable": z.status in DISPATCHABLE_ZONE_STATUSES}
 
 def notice_view(n):
     return {"id": n.id, "notice_code": n.notice_code, "zone_id": n.zone_id, "road_name": n.road_name, "contractor": n.contractor, "permit_no": n.permit_no, "starts_at": iso(n.starts_at), "ends_at": iso(n.ends_at), "boundary": n.boundary, "status": n.status, "lane_closure_required": n.lane_closure_required, "conflict_note": n.conflict_note}
@@ -81,7 +91,12 @@ def dashboard(db: Session = Depends(get_db), user: User = Depends(current_user))
     notices = db.execute(select(WorkNotice).order_by(WorkNotice.id)).scalars().all()
     resurveys = db.execute(select(Resurvey).order_by(Resurvey.id.desc())).scalars().all()
     jobs = db.execute(select(AnalysisJob).order_by(AnalysisJob.id.desc())).scalars().all()
-    return {"user": user_view(user), "stats": {"assets": len(assets), "points": len(points), "zones": len(zones), "open_zones": sum(z.status not in ["closed", "split"] for z in zones), "notices": len(notices), "resurveys": len(resurveys)}, "batches": [{"id": b.id, "batch_code": b.batch_code, "measured_at": iso(b.measured_at), "instrument": b.instrument, "coordinate_reference": b.coordinate_reference, "status": b.status, "notes": b.notes, "point_count": len(b.points)} for b in batches], "assets": [asset_view(a) for a in assets], "points": [point_view(p) for p in points], "zones": [zone_view(z, db) for z in zones], "notices": [notice_view(n) for n in notices], "resurveys": [resurvey_view(r) for r in resurveys], "jobs": [{"id": j.id, "job_code": j.job_code, "batch_id": j.batch_id, "status": j.status, "result": j.result, "error": j.error, "finished_at": iso(j.finished_at)} for j in jobs]}
+    revisions = {b.id: (b.zone_revision or 0) for b in batches}
+    pending_supplement = sum(
+        1 for p in points
+        if (p.source or "initial") == "supplement" and p.published_revision != revisions.get(p.batch_id, 0)
+    )
+    return {"user": user_view(user), "stats": {"assets": len(assets), "points": len(points), "zones": len(zones), "open_zones": sum(z.status not in ["closed", "split", "superseded"] for z in zones), "dispatchable_zones": sum(z.status in DISPATCHABLE_ZONE_STATUSES for z in zones), "pending_supplements": pending_supplement, "notices": len(notices), "resurveys": len(resurveys)}, "batches": [{"id": b.id, "batch_code": b.batch_code, "measured_at": iso(b.measured_at), "instrument": b.instrument, "coordinate_reference": b.coordinate_reference, "status": b.status, "notes": b.notes, "zone_revision": b.zone_revision or 0, "point_count": len(b.points), "supplement_count": sum(1 for p in b.points if (p.source or "initial") == "supplement")} for b in batches], "assets": [asset_view(a) for a in assets], "points": [point_view(p) for p in points], "zones": [zone_view(z, db) for z in zones], "notices": [notice_view(n) for n in notices], "resurveys": [resurvey_view(r) for r in resurveys], "jobs": [{"id": j.id, "job_code": j.job_code, "batch_id": j.batch_id, "mode": (j.input_summary or {}).get("mode", "initial"), "status": j.status, "result": j.result, "error": j.error, "finished_at": iso(j.finished_at)} for j in jobs]}
 
 @app.get("/api/survey-batches/{batch_id}")
 def batch_detail(batch_id: int, db: Session = Depends(get_db), user: User = Depends(current_user)):
@@ -104,13 +119,51 @@ def add_point(batch_id: int, payload: SurveyPointIn, db: Session = Depends(get_d
     asset = db.get(ManholeAsset, payload.manhole_id)
     if not batch or not asset:
         raise HTTPException(404, "批次或井盖资产不存在")
-    if batch.status in ["clustered", "queued"]:
-        raise HTTPException(409, "批次已进入聚类流程，不能追加测量点")
+    if batch.status in ["clustered", "queued", "recomputing"]:
+        raise HTTPException(409, {"code": "USE_SUPPLEMENT", "message": "批次已出片，追加测点请使用补测入口"})
     if db.execute(select(SurveyPoint).where(SurveyPoint.point_code == payload.point_code)).scalar_one_or_none():
         raise HTTPException(409, "测量点编号已存在")
-    point = SurveyPoint(batch_id=batch_id, manhole_id=payload.manhole_id, **payload.model_dump())
+    existing = db.execute(select(SurveyPoint).where(SurveyPoint.batch_id == batch_id, SurveyPoint.manhole_id == payload.manhole_id)).scalar_one_or_none()
+    if existing:
+        raise HTTPException(409, {"code": "DUPLICATE_MANHOLE", "message": "该井盖在本批次已有测量点；补传请使用补测入口", "point_code": existing.point_code})
+    point = SurveyPoint(batch_id=batch_id, manhole_id=payload.manhole_id, source="initial", **payload.model_dump())
     db.add(point); record(db, user.id, "add_survey_point", "SurveyPoint", payload.point_code, {"batch_code": batch.batch_code}); db.commit(); db.refresh(point)
     return point_view(point)
+
+@app.post("/api/survey-batches/{batch_id}/supplement-points")
+def add_supplement_point(batch_id: int, payload: SupplementPointIn, db: Session = Depends(get_db), user: User = Depends(require_roles("operator", "supervisor"))):
+    """聚类出片后补传同批次测点。同一 supplement_key 重试不会新增测点。"""
+    batch = db.execute(select(SurveyBatch).where(SurveyBatch.id == batch_id).with_for_update()).scalar_one_or_none()
+    if not batch:
+        raise HTTPException(404, "测量批次不存在")
+    if batch.status in ["queued", "recomputing"]:
+        raise HTTPException(409, {"code": "BATCH_BUSY", "message": "批次正在重算，待发布后再补传测点"})
+    asset = db.get(ManholeAsset, payload.manhole_id)
+    if not asset:
+        raise HTTPException(404, "井盖资产不存在")
+    supplement_key = payload.supplement_key or f"{payload.point_code}:{payload.manhole_id}"
+
+    existing_supplement = db.execute(select(SurveyPoint).where(SurveyPoint.batch_id == batch_id, SurveyPoint.supplement_key == supplement_key)).scalar_one_or_none()
+    if existing_supplement:
+        # 幂等重试：不新增测点，返回现有记录。
+        return {"created": False, "point": point_view(existing_supplement), "batch_status": batch.status, "zone_revision": batch.zone_revision or 0}
+
+    if db.execute(select(SurveyPoint).where(SurveyPoint.point_code == payload.point_code)).scalar_one_or_none():
+        raise HTTPException(409, {"code": "POINT_CODE_EXISTS", "message": "测量点编号已存在"})
+    existing_manhole = db.execute(select(SurveyPoint).where(SurveyPoint.batch_id == batch_id, SurveyPoint.manhole_id == payload.manhole_id)).scalar_one_or_none()
+    if existing_manhole:
+        raise HTTPException(409, {"code": "DUPLICATE_MANHOLE", "message": "该井盖在本批次已有测量点", "point_code": existing_manhole.point_code})
+
+    point = SurveyPoint(
+        batch_id=batch_id, manhole_id=payload.manhole_id, point_code=payload.point_code,
+        x=payload.x, y=payload.y, elevation_mm=payload.elevation_mm, settlement_mm=payload.settlement_mm,
+        coordinate_reference=payload.coordinate_reference, measured_at=payload.measured_at,
+        quality_status="checked", source="supplement", supplement_key=supplement_key, published_revision=None,
+    )
+    db.add(point); db.flush()
+    record(db, user.id, "add_supplement_point", "SurveyPoint", payload.point_code, {"batch_code": batch.batch_code, "supplement_key": supplement_key, "zone_revision": batch.zone_revision or 0})
+    db.commit(); db.refresh(point)
+    return {"created": True, "point": point_view(point), "batch_status": batch.status, "zone_revision": batch.zone_revision or 0, "recompute_required": True}
 
 @app.post("/api/survey-points/{point_id}/correct-datum")
 def correct_datum(point_id: int, db: Session = Depends(get_db), user: User = Depends(require_roles("operator", "supervisor"))):
@@ -125,9 +178,14 @@ def correct_datum(point_id: int, db: Session = Depends(get_db), user: User = Dep
 
 @app.post("/api/survey-batches/{batch_id}/cluster")
 def enqueue_cluster(batch_id: int, db: Session = Depends(get_db), user: User = Depends(require_roles("operator", "supervisor"))):
-    batch = db.get(SurveyBatch, batch_id)
+    batch = db.execute(select(SurveyBatch).where(SurveyBatch.id == batch_id).with_for_update()).scalar_one_or_none()
     if not batch:
         raise HTTPException(404, "测量批次不存在")
+    if batch.status in BUSY_BATCH_STATUSES:
+        raise HTTPException(409, {"code": "BATCH_BUSY", "message": "批次已有聚类任务在队列中"})
+    pending_job = db.execute(select(AnalysisJob).where(AnalysisJob.batch_id == batch.id, AnalysisJob.status.in_(["queued", "running"]))).scalar_one_or_none()
+    if pending_job:
+        raise HTTPException(409, {"code": "JOB_IN_FLIGHT", "message": "同批次已有未完成的分析任务", "job_code": pending_job.job_code})
     points = build_input(db, batch)
     refs = {batch.coordinate_reference, *(p["coordinate_reference"] for p in points)}
     if len(refs) != 1:
@@ -136,10 +194,61 @@ def enqueue_cluster(batch_id: int, db: Session = Depends(get_db), user: User = D
         db.commit()
         conflicts = [p["point_code"] for p in points if p["coordinate_reference"] != batch.coordinate_reference]
         raise HTTPException(status_code=409, detail={"code": "DATUM_CONFLICT", "message": "测量点存在坐标基准冲突，禁止聚类", "point_codes": conflicts, "batch_status": batch.status})
-    job = AnalysisJob(job_code=f"JOB-{batch.batch_code}-{int(datetime.now().timestamp())}", batch_id=batch.id, status="queued", input_summary={"points": points, "params": {"eps_m": 26.0, "min_samples": 3}})
-    batch.status = "queued"; db.add(job); record(db, user.id, "enqueue_spatial_cluster", "AnalysisJob", job.job_code, {"batch_code": batch.batch_code, "point_count": len(points)}); db.commit(); db.refresh(job)
+    return _enqueue(db, user, batch, "initial", points)
+
+@app.post("/api/survey-batches/{batch_id}/recompute")
+def enqueue_recompute(batch_id: int, db: Session = Depends(get_db), user: User = Depends(require_roles("operator", "supervisor"))):
+    """补传后在同一批次重算待派工热区。已开单片区范围冻结。"""
+    batch = db.execute(select(SurveyBatch).where(SurveyBatch.id == batch_id).with_for_update()).scalar_one_or_none()
+    if not batch:
+        raise HTTPException(404, "测量批次不存在")
+    if batch.status in BUSY_BATCH_STATUSES:
+        raise HTTPException(409, {"code": "BATCH_BUSY", "message": "批次已有重算任务在队列中"})
+    pending_job = db.execute(select(AnalysisJob).where(AnalysisJob.batch_id == batch.id, AnalysisJob.status.in_(["queued", "running"]))).scalar_one_or_none()
+    if pending_job:
+        raise HTTPException(409, {"code": "JOB_IN_FLIGHT", "message": "同批次已有未完成的重算任务", "job_code": pending_job.job_code})
+    revision = batch.zone_revision or 0
+    pending_points = db.execute(
+        select(SurveyPoint).where(
+            SurveyPoint.batch_id == batch.id,
+            SurveyPoint.source == "supplement",
+            (SurveyPoint.published_revision.is_(None)) | (SurveyPoint.published_revision != revision),
+        )
+    ).scalars().all()
+    if not pending_points:
+        # 补测重试没有新测点时不再发布新版本，因此不会新增片区。
+        raise HTTPException(409, {"code": "NO_PENDING_SUPPLEMENT", "message": "没有待纳入的补测点，未重算；同批补测重试不会新增片区", "zone_revision": revision})
+    points = build_input(db, batch)
+    refs = {batch.coordinate_reference, *(p["coordinate_reference"] for p in points)}
+    if len(refs) != 1:
+        batch.status = "blocked"
+        conflicts = [p["point_code"] for p in points if p["coordinate_reference"] != batch.coordinate_reference]
+        record(db, user.id, "block_recompute_datum_conflict", "SurveyBatch", batch.batch_code, {"references": sorted(refs)})
+        db.commit()
+        raise HTTPException(status_code=409, detail={"code": "DATUM_CONFLICT", "message": "补传测点坐标基准冲突，未重算；旧版待派工片区保持不变", "point_codes": conflicts, "batch_status": batch.status})
+    return _enqueue(db, user, batch, "supplement", points)
+
+def unique_code(prefix, db=None, model=None, column=None):
+    """秒级时间戳 + 递增后缀，避免同一秒内的两笔操作撞号。"""
+    base = int(datetime.now().timestamp())
+    code = f"{prefix}-{base}"
+    if db is None or model is None:
+        return code
+    suffix = 1
+    while db.execute(select(model).where(column == code)).scalar_one_or_none():
+        suffix += 1
+        code = f"{prefix}-{base}-{suffix}"
+    return code
+
+def _enqueue(db, user, batch, mode, points):
+    previous_status = batch.status
+    job = AnalysisJob(job_code=unique_code(f"JOB-{batch.batch_code}", db, AnalysisJob, AnalysisJob.job_code), batch_id=batch.id, status="queued", input_summary={"points": points, "mode": mode, "batch_status_before": previous_status, "base_revision": batch.zone_revision or 0, "params": {"eps_m": 26.0, "min_samples": 3}})
+    batch.status = "recomputing" if mode == "supplement" else "queued"
+    db.add(job)
+    record(db, user.id, "enqueue_pending_zone_recompute" if mode == "supplement" else "enqueue_spatial_cluster", "AnalysisJob", job.job_code, {"batch_code": batch.batch_code, "point_count": len(points), "mode": mode, "base_revision": batch.zone_revision or 0})
+    db.commit(); db.refresh(job)
     redis_client.rpush("manhole_settlement_jobs", str(job.id))
-    return {"job_id": job.id, "job_code": job.job_code, "status": job.status}
+    return {"job_id": job.id, "job_code": job.job_code, "status": job.status, "mode": mode, "base_revision": batch.zone_revision or 0}
 
 @app.get("/api/analysis-jobs/{job_id}")
 def job_detail(job_id: int, db: Session = Depends(get_db), user: User = Depends(current_user)):
@@ -155,6 +264,11 @@ def zones(db: Session = Depends(get_db), user: User = Depends(current_user)):
 def split_zone(zone_id: int, db: Session = Depends(get_db), user: User = Depends(require_roles("supervisor"))):
     zone = db.get(RepairZone, zone_id)
     if not zone: raise HTTPException(404, "维修片区不存在")
+    batch = db.execute(select(SurveyBatch).where(SurveyBatch.id == zone.batch_id).with_for_update()).scalar_one_or_none()
+    db.refresh(zone)
+    if not batch: raise HTTPException(404, "测量批次不存在")
+    if zone.status == "superseded" or (zone.revision is not None and zone.revision != (batch.zone_revision or 0)):
+        raise HTTPException(status_code=409, detail={"code": "ZONE_SUPERSEDED", "message": "该片区已被新版重算结果停用，不能按旧范围拆分"})
     if zone.status != "needs_split": raise HTTPException(409, "当前片区没有待拆分的道路边界冲突")
     points = db.execute(select(SurveyPoint).where(SurveyPoint.id.in_(zone.point_ids))).scalars().all()
     notice = db.get(WorkNotice, zone.conflict_notice_id)
@@ -168,7 +282,7 @@ def split_zone(zone_id: int, db: Session = Depends(get_db), user: User = Depends
     children = []
     for idx, members in enumerate([left, right], 1):
         b = bounds([{ "x": p.x, "y": p.y } for p in members])
-        child = RepairZone(zone_code=f"{zone.zone_code}-S{idx}", batch_id=zone.batch_id, cluster_label=zone.cluster_label, name=f"{zone.name} / 边界片 {idx}", status="ready_for_notice", point_ids=[p.id for p in members], center_x=round(sum(p.x for p in members)/len(members),2), center_y=round(sum(p.y for p in members)/len(members),2), average_settlement_mm=round(sum(p.settlement_mm for p in members)/len(members),2), max_settlement_mm=max(p.settlement_mm for p in members), local_density=zone.local_density, boundary=b, original_cluster_evidence={"split_from": zone.zone_code, "split_axis": "x", "split_x": split_x, "source_evidence": zone.original_cluster_evidence}, split_from_id=zone.id)
+        child = RepairZone(zone_code=f"{zone.zone_code}-S{idx}", batch_id=zone.batch_id, cluster_label=zone.cluster_label, name=f"{zone.name} / 边界片 {idx}", status="ready_for_notice", point_ids=[p.id for p in members], center_x=round(sum(p.x for p in members)/len(members),2), center_y=round(sum(p.y for p in members)/len(members),2), average_settlement_mm=round(sum(p.settlement_mm for p in members)/len(members),2), max_settlement_mm=max(p.settlement_mm for p in members), local_density=zone.local_density, boundary=b, original_cluster_evidence={"split_from": zone.zone_code, "split_axis": "x", "split_x": split_x, "source_evidence": zone.original_cluster_evidence}, split_from_id=zone.id, revision=zone.revision)
         db.add(child); children.append(child)
     record(db, user.id, "split_zone_by_road_boundary", "RepairZone", zone.zone_code, {"children": [f"{zone.zone_code}-S1", f"{zone.zone_code}-S2"], "split_x": split_x})
     db.commit()
@@ -176,11 +290,23 @@ def split_zone(zone_id: int, db: Session = Depends(get_db), user: User = Depends
 
 @app.post("/api/zones/{zone_id}/work-notices")
 def create_notice(zone_id: int, payload: NoticeIn, db: Session = Depends(get_db), user: User = Depends(require_roles("operator", "supervisor"))):
+    """提交施工联动单。与待派工片区重算共用批次行锁，二者串行执行。
+
+    - 先开单、后发布：重算会把该片区识别为已开单，冻结原范围。
+    - 先发布、后开单：片区版本已过期并被停用，开单入口返回 409。
+    """
     zone = db.get(RepairZone, zone_id)
     if not zone: raise HTTPException(404, "维修片区不存在")
-    if zone.status not in ["proposed", "ready_for_notice"]: raise HTTPException(409, "当前片区不能发起施工联动")
-    notice = WorkNotice(notice_code=f"WN-{zone.zone_code}-{int(datetime.now().timestamp())}", zone_id=zone.id, road_name=payload.road_name, contractor=payload.contractor, permit_no=payload.permit_no, starts_at=payload.starts_at, ends_at=payload.ends_at, boundary=zone.boundary, status="submitted", lane_closure_required=payload.lane_closure_required, created_by=user.id)
-    db.add(notice); zone.status = "notice_sent"; record(db, user.id, "submit_work_notice", "WorkNotice", notice.notice_code, {"zone_code": zone.zone_code}); db.commit(); db.refresh(notice)
+    batch = db.execute(select(SurveyBatch).where(SurveyBatch.id == zone.batch_id).with_for_update()).scalar_one_or_none()
+    db.refresh(zone)
+    if not batch: raise HTTPException(404, "测量批次不存在")
+    if zone.status == "superseded" or (zone.revision is not None and zone.revision != (batch.zone_revision or 0)):
+        record(db, user.id, "reject_stale_zone_notice", "RepairZone", zone.zone_code, {"zone_revision": zone.revision, "batch_revision": batch.zone_revision or 0})
+        db.commit()
+        raise HTTPException(status_code=409, detail={"code": "ZONE_SUPERSEDED", "message": "该片区已被新版重算结果停用，请使用最新待派工片区开单", "zone_code": zone.zone_code, "zone_revision": zone.revision, "batch_revision": batch.zone_revision or 0})
+    if zone.status not in DISPATCHABLE_ZONE_STATUSES: raise HTTPException(409, "当前片区不能发起施工联动")
+    notice = WorkNotice(notice_code=unique_code(f"WN-{zone.zone_code}", db, WorkNotice, WorkNotice.notice_code), zone_id=zone.id, road_name=payload.road_name, contractor=payload.contractor, permit_no=payload.permit_no, starts_at=payload.starts_at, ends_at=payload.ends_at, boundary=zone.boundary, status="submitted", lane_closure_required=payload.lane_closure_required, created_by=user.id)
+    db.add(notice); zone.status = "notice_sent"; record(db, user.id, "submit_work_notice", "WorkNotice", notice.notice_code, {"zone_code": zone.zone_code, "zone_revision": zone.revision, "batch_revision": batch.zone_revision or 0}); db.commit(); db.refresh(notice)
     return notice_view(notice)
 
 @app.post("/api/work-notices/{notice_id}/acknowledge")

@@ -14,6 +14,7 @@
 
 - 井盖资产与测量批次登记，记录坐标基准、仪器、沉降值和测量质量状态。
 - 对同一坐标基准的测量点执行 DBSCAN，使用局部密度评分排序维修片区。
+- 聚类出片后可在原批次补录测点，只重算待派工热区；已开施工联动单的片区连同井盖点冻结原范围，不参与邻近点聚类。
 - 发现施工边界冲突时阻止直接施工，主管按道路边界拆分片区并保留原始聚类证据。
 - 施工联动单提交、主管确认、维修启动、复测提交和主管核验销项。
 - JWT 三角色权限、审计日志、请求限流、Redis 异步任务和 worker 心跳。
@@ -52,6 +53,18 @@ docker compose exec backend python -m scripts.seed_demo
 ## 算法口径
 
 worker 使用固定参数 `DBSCAN(eps=26m, min_samples=3)` 对同一测量批次的二维投影坐标聚类。每个非噪声簇写入 `RepairZone`。局部密度评分为 `簇内点数 / 外接矩形面积 × 10,000`。坐标基准集合不为单一值时，后端以 `409 DATUM_CONFLICT` 拒绝聚类。算法输入、参数、结果摘要、失败状态和完成时间均写入 `AnalysisJob`。
+
+### 补测重算待派工热区
+
+聚类出片后，测量员仍可通过 `POST /api/survey-batches/{id}/supplement-points` 补传同批次测点（`source=supplement`）。补传点带幂等键 `supplement_key`；同一键重试返回既有记录，不新增测点。
+
+`POST /api/survey-batches/{id}/recompute` 在同一批次重算待派工热区：
+
+- 只有未开单的待派工片区（`proposed / needs_split / ready_for_notice`）会被替换；已开施工联动单（含 draft、submitted、acknowledged、active、completed）的片区范围冻结，其井盖点不参与邻近点 DBSCAN。
+- 每次成功发布把 `SurveyBatch.zone_revision` +1，新片区带 `revision`；旧版待派工片区置为 `superseded`，其开单入口立即失效（`409 ZONE_SUPERSEDED`），新片区编码带版本号 `RZ-…-R{n}-01`。
+- 重算与开单共用批次行锁（`SELECT … FOR UPDATE`）串行执行：先开单则重算识别为冻结；先发布则旧片区开单被拒。
+- 发布失败（含补测点坐标基准冲突）整批回滚，旧版待派工片区保持原状态；没有新补测点时 `409 NO_PENDING_SUPPLEMENT`，同批补测重试不新增片区。
+- 热区复核页可补录测点、查看发布版本与待重算补测数，并标注每个片区是“可派工 / 范围冻结 / 已停用”。
 
 ## 技术栈与目录
 

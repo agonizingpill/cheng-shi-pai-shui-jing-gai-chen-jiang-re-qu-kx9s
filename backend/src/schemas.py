@@ -15,6 +15,10 @@ class SurveyPointIn(BaseModel):
     coordinate_reference: str
     measured_at: datetime
 
+class SupplementPointIn(SurveyPointIn):
+    # 补测绘等幂键；缺省时由 point_code + manhole_id 生成
+    supplement_key: str | None = Field(default=None, max_length=100)
+
 class BatchIn(BaseModel):
     batch_code: str
     measured_at: datetime
